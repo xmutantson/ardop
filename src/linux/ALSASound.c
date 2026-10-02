@@ -1501,7 +1501,12 @@ int SoundCardRead(short * input, unsigned int nSamples)
 	int avail;
 	int start;
 
-	if (rechandle == NULL)
+	if (rechandle == NULL || nSamples == 0)
+		return 0;
+
+	// samples[] contains interleaved shorts, while nSamples counts frames.
+	if ((m_recchannels != 1 && m_recchannels != 2) ||
+		nSamples > sizeof(samples) / sizeof(samples[0]) / m_recchannels)
 		return 0;
 
 	avail = snd_pcm_avail_update(rechandle);
@@ -1516,12 +1521,14 @@ int SoundCardRead(short * input, unsigned int nSamples)
 		}
 
 		OpenSoundCapture(SavedCaptureDevice, SavedCaptureRate, NULL);
+		if (rechandle == NULL)
+			return 0;
 //		snd_pcm_recover(rechandle, avail, 0);
 		avail = snd_pcm_avail_update(rechandle);
 		ZF_LOGD("After avail recovery %d ..", avail);
 	}
 
-	if (avail < nSamples)
+	if (avail < 0 || (unsigned int)avail < nSamples)
 		return 0;
 
 //	Debugprintf("ALSARead available %d", avail);
@@ -1539,6 +1546,8 @@ int SoundCardRead(short * input, unsigned int nSamples)
 		}
 
 		OpenSoundCapture(SavedCaptureDevice, SavedCaptureRate, NULL);
+		if (rechandle == NULL)
+			return 0;
 //		snd_pcm_recover(rechandle, avail, 0);
 		avail = snd_pcm_avail_update(rechandle);
 		ZF_LOGD("After Read recovery Avail %d ..", avail);
@@ -1548,10 +1557,8 @@ int SoundCardRead(short * input, unsigned int nSamples)
 
 	if (m_recchannels == 1)
 	{
-		for (n = 0; n < ret; n++)
-		{
-			memcpy(input, samples, nSamples*sizeof(short));
-		}
+		// A successful ALSA read can still return fewer frames than requested.
+		memcpy(input, samples, ret * sizeof(short));
 	}
 	else
 	{
@@ -1625,18 +1632,19 @@ void PollReceivedSamples()
 	// Process any captured samples
 	// Ideally call at least every 100 mS, more than 200 will loose data
 
-	if (SoundCardRead(&inbuffer[0][0], ReceiveSize))
+	int received = SoundCardRead(&inbuffer[0][0], ReceiveSize);
+	if (received > 0)
 	{
-		// returns ReceiveSize or none
+		// Only the returned frames are fresh, including after a short read.
 
 		short * ptr = &inbuffer[0][0];
 		int i;
 
-		if (add_noise(&inbuffer[0][0], ReceiveSize, InputNoiseStdDev) > 0) {
+		if (add_noise(&inbuffer[0][0], received, InputNoiseStdDev) > 0) {
 			max = 32767;
 			min = -32768;
 		} else {
-			for (i = 0; i < ReceiveSize; i++)
+			for (i = 0; i < received; i++)
 			{
 				if (*(ptr) < min)
 					min = *ptr;
@@ -1693,12 +1701,12 @@ void PollReceivedSamples()
 				rxwf = NULL;
 			}
 			else
-				WriteWav(&inbuffer[0][0], ReceiveSize, rxwf);
+				WriteWav(&inbuffer[0][0], received, rxwf);
 		}
 
 
 		if (Capturing && Loopback == FALSE)
-			ProcessNewSamples(&inbuffer[0][0], ReceiveSize);
+			ProcessNewSamples(&inbuffer[0][0], received);
 	}
 }
 
