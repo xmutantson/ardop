@@ -11,6 +11,8 @@
 #define ZF_LOGI(...) ((void)0)
 
 void *rechandle = (void *)1;
+int captureRetryPending = 0, captureRetryScheduled = 0;
+unsigned int captureLastRetry = 0;
 char SavedCaptureDevice[] = "mock";
 int SavedCaptureRate = 12000, m_recchannels = 1, UseLeftRX = 1;
 char PlaybackDevice[16] = "mock";
@@ -25,6 +27,7 @@ int rxwf_EndNow = 1000;
 short source_samples[] = {100, -200, 300, -400, 500, -600, 700, -800};
 int available = 4, read_result = 4, read_calls, open_calls, close_calls;
 int reopen_ok = 1, after_reopen_available = 4;
+int failed_open_keeps_handle = 0, reopen_channels = 0;
 int noise_count, wav_count, decode_count, wav_closed, level_calls;
 short decoded[16];
 
@@ -39,12 +42,14 @@ int snd_pcm_readi(void *handle, short *samples, unsigned int requested)
     return read_result;
 }
 int snd_pcm_close(void *handle) { assert(handle); close_calls++; return 0; }
-void OpenSoundCapture(char *device, int rate, void *unused)
+int OpenSoundCapture(char *device, int rate, void *unused)
 {
     (void)device; (void)rate; (void)unused;
     open_calls++;
-    rechandle = reopen_ok ? (void *)1 : NULL;
+    rechandle = (reopen_ok || failed_open_keeps_handle) ? (void *)1 : NULL;
     available = after_reopen_available;
+    if (reopen_channels) m_recchannels = reopen_channels;
+    return reopen_ok;
 }
 int add_noise(short *samples, int count, int deviation)
 {
@@ -70,6 +75,9 @@ void ProcessNewSamples(short *samples, int count)
 void reset(void)
 {
     rechandle = (void *)1;
+    captureRetryPending = captureRetryScheduled = 0;
+    captureLastRetry = 0;
+    failed_open_keeps_handle = reopen_channels = 0;
     available = after_reopen_available = read_result = ReceiveSize = 4;
     m_recchannels = UseLeftRX = reopen_ok = Capturing = 1;
     Loopback = 0;
@@ -148,6 +156,36 @@ int main(void)
 
     reset(); rechandle = NULL; PollReceivedSamples();
     assert(read_calls == 0 && decode_count == 0); tests++;
+
+    reset(); available = -32; reopen_ok = 0; PollReceivedSamples();
+    assert(open_calls == 1 && captureRetryPending);
+    for (int i = 0; i < 999; ++i) { Now++; PollReceivedSamples(); }
+    assert(open_calls == 1 && decode_count == 0);
+    Now++; reopen_ok = 1; PollReceivedSamples();
+    assert(open_calls == 2 && decode_count == 4 && !captureRetryPending); tests++;
+
+    reset(); available = -32; reopen_ok = 0; failed_open_keeps_handle = 1;
+    PollReceivedSamples();
+    assert(rechandle == NULL && open_calls == 1 && close_calls == 2);
+    assert(read_calls == 0 && decode_count == 0); tests++;
+
+    reset(); available = after_reopen_available = -32;
+    for (int i = 0; i < 5000; ++i) { PollReceivedSamples(); Now++; }
+    assert(open_calls == 5 && rechandle == NULL && decode_count == 0); tests++;
+
+    reset(); available = -32; reopen_ok = 0; Now = -500;
+    PollReceivedSamples(); Now = 499; PollReceivedSamples();
+    assert(open_calls == 1);
+    Now = 500; reopen_ok = 1; PollReceivedSamples();
+    assert(open_calls == 2 && decode_count == 4); tests++;
+
+    reset(); rechandle = NULL;
+    for (int i = 0; i < 10; ++i) { Now += 1000; PollReceivedSamples(); }
+    assert(open_calls == 0 && read_calls == 0); tests++;
+
+    reset(); available = -32; reopen_channels = 2; ReceiveSize = 32769;
+    PollReceivedSamples();
+    assert(open_calls == 1 && read_calls == 0 && decode_count == 0); tests++;
 
     printf("PASS: %d offline ALSA capture cases\n", tests);
     return 0;

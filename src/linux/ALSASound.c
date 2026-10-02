@@ -609,6 +609,12 @@ void txSleep(int mS)
 
 snd_pcm_t *	playhandle = NULL;
 snd_pcm_t *	rechandle = NULL;
+// Only an unexpected capture failure schedules a retry. Playback/shutdown
+// cancel it explicitly so polling cannot reopen a deliberately closed device.
+static int captureRetryPending = 0;
+static int captureRetryScheduled = 0;
+static unsigned int captureLastRetry = 0;
+
 
 int m_playchannels = 1;
 int m_recchannels = 1;
@@ -850,6 +856,7 @@ int GetInputDeviceCollection()
 		return 0;
 	}
 
+	captureRetryPending = captureRetryScheduled = 0;
 	if (rechandle)
 		snd_pcm_close(rechandle);
 
@@ -1167,7 +1174,7 @@ int OpenSoundCapture(char * CaptureDevice, int m_sampleRate, char * ErrorMsg)
 
 	char buf1[100];
 	char * ptr;
-	snd_pcm_hw_params_t *hw_params;
+	snd_pcm_hw_params_t *hw_params = NULL;
 
 	if (rechandle)
 	{
@@ -1186,17 +1193,17 @@ int OpenSoundCapture(char * CaptureDevice, int m_sampleRate, char * ErrorMsg)
 			sprintf (ErrorMsg, "cannot open capture audio device %s (%s)",  buf1, snd_strerror(err));
 		else
 			ZF_LOGE("cannot open capture audio device %s (%s)", buf1, snd_strerror(err));
-		return false;
+		goto capture_failed;
 	}
 
 	if ((err = snd_pcm_hw_params_malloc (&hw_params)) < 0) {
 		ZF_LOGE("cannot allocate capture hardware parameter structure (%s)", snd_strerror(err));
-		return false;
+		goto capture_failed;
 	}
 
 	if ((err = snd_pcm_hw_params_any (rechandle, hw_params)) < 0) {
 		ZF_LOGE("cannot initialize capture hardware parameter structure (%s)", snd_strerror(err));
-		return false;
+		goto capture_failed;
 	}
 
 // craiger add frames per period
@@ -1207,18 +1214,18 @@ int OpenSoundCapture(char * CaptureDevice, int m_sampleRate, char * ErrorMsg)
 	if ((err = snd_pcm_hw_params_set_period_size_near (rechandle, hw_params, &fpp, &dir)) < 0)
 	{
 		ZF_LOGE("snd_pcm_hw_params_set_period_size_near failed (%s)", snd_strerror(err));
-		return false;
+		goto capture_failed;
 	}
 
 	if ((err = snd_pcm_hw_params_set_access (rechandle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0)
 	{
 		ZF_LOGE("cannot set capture access type (%s)", snd_strerror(err));
-		return false;
+		goto capture_failed;
 	}
 	if ((err = snd_pcm_hw_params_set_format (rechandle, hw_params, SND_PCM_FORMAT_S16_LE)) < 0)
 	{
 		ZF_LOGE("cannot set capture sample format (%s)", snd_strerror(err));
-		return false;
+		goto capture_failed;
 	}
 
 	if ((err = snd_pcm_hw_params_set_rate (rechandle, hw_params, m_sampleRate, 0)) < 0)
@@ -1227,7 +1234,7 @@ int OpenSoundCapture(char * CaptureDevice, int m_sampleRate, char * ErrorMsg)
 			sprintf (ErrorMsg, "cannot set capture sample rate (%s)", snd_strerror(err));
 		else
 			ZF_LOGE("cannot set capture sample rate (%s)", snd_strerror(err));
-		return false;
+		goto capture_failed;
 	}
 
 	m_recchannels = 1;
@@ -1249,30 +1256,44 @@ int OpenSoundCapture(char * CaptureDevice, int m_sampleRate, char * ErrorMsg)
 			if ((err = snd_pcm_hw_params_set_channels (rechandle, hw_params, 2)) < 0)
 			{
 				ZF_LOGE("cannot set rec channel count to 2 (%s)", snd_strerror(err));
-				return false;
+				goto capture_failed;
 			}
 			if (ErrorMsg)
 				sprintf (ErrorMsg, "Record channel count set to 2 (%s)", snd_strerror(err));
 			else
 				ZF_LOGI("Record channel count set to 2 (%s)", snd_strerror(err));
 		}
+		else
+			goto capture_failed;
 	}
 
 	if ((err = snd_pcm_hw_params (rechandle, hw_params)) < 0) {
 		fprintf (stderr, "cannot set parameters (%s)", snd_strerror(err));
-		return false;
+		goto capture_failed;
 	}
 
 	snd_pcm_hw_params_free(hw_params);
+	hw_params = NULL;
 
 	if ((err = snd_pcm_prepare (rechandle)) < 0) {
 		ZF_LOGE("cannot prepare audio interface for use (%s)", snd_strerror(err));
-		return FALSE;
+		goto capture_failed;
 	}
 
-	snd_pcm_start(rechandle);  // without this avail stuck at 0
+	if ((err = snd_pcm_start(rechandle)) < 0) {  // without this avail is stuck at 0
+		ZF_LOGE("cannot start capture audio interface (%s)", snd_strerror(err));
+		goto capture_failed;
+	}
 
 	return TRUE;
+
+capture_failed:
+	if (hw_params)
+		snd_pcm_hw_params_free(hw_params);
+	if (rechandle)
+		snd_pcm_close(rechandle);
+	rechandle = NULL;
+	return FALSE;
 }
 
 int OpenSoundCard(char * CaptureDevice, char * PlaybackDevice, int c_sampleRate, int p_sampleRate, char * ErrorMsg)
@@ -1336,6 +1357,7 @@ int OpenSoundCard(char * CaptureDevice, char * PlaybackDevice, int c_sampleRate,
 
 int CloseSoundCard()
 {
+	captureRetryPending = captureRetryScheduled = 0;
 	if (rechandle)
 	{
 		snd_pcm_close(rechandle);
@@ -1362,6 +1384,7 @@ int SoundCardWrite(short * input, unsigned int nSamples)
 		return 0;
 
 	// Stop Capture
+	captureRetryPending = captureRetryScheduled = 0;
 
 	if (rechandle)
 	{
@@ -1496,83 +1519,77 @@ int xSoundCardClearInput()
 int SoundCardRead(short * input, unsigned int nSamples)
 {
 	short samples[65536];
-	int n;
-	int ret;
-	int avail;
-	int start;
+	int n, ret, avail, start;
+	int retried = 0;
+	int readFailed = 0;
 
-	if (rechandle == NULL || nSamples == 0)
+	if (nSamples == 0 || (rechandle == NULL && !captureRetryPending))
 		return 0;
 
-	// samples[] contains interleaved shorts, while nSamples counts frames.
+read_available:
+	// Recheck after a reopen: negotiated channel count may have changed.
 	if ((m_recchannels != 1 && m_recchannels != 2) ||
 		nSamples > sizeof(samples) / sizeof(samples[0]) / m_recchannels)
 		return 0;
 
+	if (rechandle == NULL)
+		goto recover_capture;
 	avail = snd_pcm_avail_update(rechandle);
-
 	if (avail < 0)
 	{
-		ZF_LOGD("avail Recovering from %s ..", snd_strerror((int)avail));
-		if (rechandle)
-		{
-			snd_pcm_close(rechandle);
-			rechandle = NULL;
-		}
-
-		OpenSoundCapture(SavedCaptureDevice, SavedCaptureRate, NULL);
-		if (rechandle == NULL)
-			return 0;
-//		snd_pcm_recover(rechandle, avail, 0);
-		avail = snd_pcm_avail_update(rechandle);
-		ZF_LOGD("After avail recovery %d ..", avail);
+		ZF_LOGD("avail Recovering from %s ..", snd_strerror(avail));
+		goto recover_capture;
 	}
-
-	if (avail < 0 || (unsigned int)avail < nSamples)
+	if ((unsigned int)avail < nSamples)
 		return 0;
 
-//	Debugprintf("ALSARead available %d", avail);
-
 	ret = snd_pcm_readi(rechandle, samples, nSamples);
-
 	if (ret < 0)
 	{
 		ZF_LOGE("RX Error %d", ret);
-//		snd_pcm_recover(rechandle, avail, 0);
-		if (rechandle)
-		{
-			snd_pcm_close(rechandle);
-			rechandle = NULL;
-		}
-
-		OpenSoundCapture(SavedCaptureDevice, SavedCaptureRate, NULL);
-		if (rechandle == NULL)
-			return 0;
-//		snd_pcm_recover(rechandle, avail, 0);
-		avail = snd_pcm_avail_update(rechandle);
-		ZF_LOGD("After Read recovery Avail %d ..", avail);
-
-		return 0;
+		readFailed = 1;
+		goto recover_capture;
 	}
 
 	if (m_recchannels == 1)
-	{
-		// A successful ALSA read can still return fewer frames than requested.
 		memcpy(input, samples, ret * sizeof(short));
-	}
 	else
 	{
-		if (UseLeftRX)
-			start = 0;
-		else
-			start = 1;
-
-		for (n = 0; n < ret; n++)  // pack the selected channel into consecutive samples
+		start = UseLeftRX ? 0 : 1;
+		for (n = 0; n < ret; n++)
 			input[n] = samples[2 * n + start];
 	}
 	return ret;
-}
 
+recover_capture:
+	if (rechandle)
+	{
+		snd_pcm_close(rechandle);
+		rechandle = NULL;
+	}
+	captureRetryPending = 1;
+	// At most one reopen in this poll and one per second across polls.
+	// Unsigned subtraction remains valid when the millisecond clock wraps.
+	if (retried || (captureRetryScheduled &&
+		(unsigned int)Now - captureLastRetry < 1000U))
+		return 0;
+	captureRetryScheduled = 1;
+	captureLastRetry = (unsigned int)Now;
+	retried = 1;
+	if (!OpenSoundCapture(SavedCaptureDevice, SavedCaptureRate, NULL) || !rechandle)
+	{
+		// Treat the initializer's return as authoritative, even if a backend
+		// left a non-null handle. Never query or decode that failed stream.
+		if (rechandle)
+			snd_pcm_close(rechandle);
+		rechandle = NULL;
+		return 0;
+	}
+	captureRetryPending = 0;
+	if (readFailed)
+		return 0;  // The failed read produced no samples.
+	goto read_available;
+}
 
 
 
@@ -1866,7 +1883,11 @@ void SoundFlush()
 	// }
 
 	if (strcmp(PlaybackDevice, "NOSOUND") != 0)
-		OpenSoundCapture(SavedCaptureDevice, SavedCaptureRate, strFault);
+	{
+		captureRetryPending = !OpenSoundCapture(SavedCaptureDevice, SavedCaptureRate, strFault);
+		captureRetryScheduled = captureRetryPending;
+		captureLastRetry = (unsigned int)Now;
+	}
 	StartCapture();
 
 	if (WriteRxWav)
